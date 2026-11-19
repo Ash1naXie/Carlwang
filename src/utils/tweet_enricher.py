@@ -7,7 +7,6 @@ import uuid
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 
-from ..api.chatgpt_client import chatgpt_client
 from ..database.topic_dao import topic_dao
 from ..database.kol_dao import kol_dao
 from ..database.project_dao import ProjectDAO
@@ -15,9 +14,8 @@ from ..database.connection import db_manager
 from ..models.tweet import Tweet
 from ..models.topic import Topic
 from ..models.project import Project
-from .advanced_topic_processor import advanced_topic_processor
-from .smart_classifier import smart_classifier
-from .token_extractor import token_extractor
+from ..utils.token_extractor import token_extractor
+from ..utils.rootdata_project_matcher import rootdata_project_matcher
 
 
 class TweetEnricher:
@@ -26,11 +24,10 @@ class TweetEnricher:
     def __init__(self):
         """初始化推文增强器"""
         self.logger = logging.getLogger(__name__)
-        self.chatgpt = chatgpt_client
+        self.chatgpt = None
         self.topic_dao = topic_dao
         self.kol_dao = kol_dao
         self.project_dao = ProjectDAO()
-        self.token_extractor = token_extractor
 
         # 缓存已知的KOL用户ID，避免重复查询
         self._kol_user_cache = {}
@@ -191,7 +188,7 @@ class TweetEnricher:
                         # 最后的保险：设置基本字段后使用原推文
                         tweet.kol_id = user_data_map.get(tweet.id_str, {}).get('id_str')
                         tweet.sentiment = None
-                        tweet.isAnnounce = 0
+                        tweet.is_announce = 0
                         enriched_tweets.append(tweet)
             
             self.logger.info(f"项目推文简化增强完成: {len(enriched_tweets)}/{len(tweets)} 成功")
@@ -232,7 +229,7 @@ class TweetEnricher:
             tweet.sentiment = self._simple_sentiment_analysis(tweet.full_text)
             
             # 4. 基础公告检测（简化版本）
-            tweet.isAnnounce = self._simple_announcement_detection(tweet.full_text)
+            tweet.is_announce = self._simple_announcement_detection(tweet.full_text)
             tweet.summary = None  # 不生成AI总结
             
             # 5. 基础活动检测（简化版本）
@@ -246,7 +243,7 @@ class TweetEnricher:
             tweet.project_tag = None
             tweet.token_tag = None
             
-            self.logger.info(f"项目推文 {tweet.id_str} 极简化增强完成: kol_id={tweet.kol_id}, sentiment={tweet.sentiment}, isAnnounce={tweet.isAnnounce}, is_activity={tweet.is_activity}")
+            self.logger.info(f"项目推文 {tweet.id_str} 极简化增强完成: kol_id={tweet.kol_id}, sentiment={tweet.sentiment}, is_announce={tweet.is_announce}, is_activity={tweet.is_activity}")
             return tweet
             
         except Exception as e:
@@ -406,7 +403,7 @@ class TweetEnricher:
             
             # 3. 设置默认值
             tweet.sentiment = None
-            tweet.isAnnounce = 0
+            tweet.is_announce = 0
             tweet.summary = None
             tweet.is_activity = 0
             tweet.activity_detail = None
@@ -494,96 +491,26 @@ class TweetEnricher:
             is_project_kol = self._is_project_kol(tweet.kol_id)
             tweet.is_real_project_tweet = 1 if is_project_kol else 0
             
-            # 4. 内容质量检查：判断是否为有效的Crypto相关内容
-            # 项目官方推文无需严格的内容验证，直接标记为有效
-            try:
-                if is_project_kol:
-                    is_valid = True
-                    self.logger.debug(f"推文 {tweet.id_str} 来自项目官方账号，跳过内容验证")
-                else:
-                    is_valid = self._validate_crypto_content(tweet.full_text, use_ai=True)
-                    
-                tweet.is_valid = is_valid
-                self.logger.debug(f"推文 {tweet.id_str} 内容有效性: {is_valid}")
-            except Exception as e:
-                self.logger.error(f"推文 {tweet.id_str} 内容验证失败: {e}")
-                # 内容验证失败时默认为有效
-                tweet.is_valid = 1
-                is_valid = 1
-            
-            # 5. 仅对有效推文进行进一步分析
-            if is_valid:
-                # 5.1 情绪分析
-                sentiment = self._analyze_tweet_sentiment(tweet.full_text, use_ai=True)
-                tweet.sentiment = sentiment
+            # 4. 爬虫阶段只做抓取入库所需的基础字段，不做 AI/语义分析。
+            tweet.is_valid = 1
+            tweet.sentiment = None
+            tweet.entity_id = None
+            tweet.token_tag = token_extractor.extract_symbols_from_text(tweet.full_text)
+            tweet.project_tag = None
+            if tweet.token_tag:
+                for symbol in tweet.token_tag.split(","):
+                    project_tag = rootdata_project_matcher.match_project_name(symbol.strip())
+                    if project_tag:
+                        tweet.project_tag = project_tag
+                        break
+            tweet.is_announce = 0
+            tweet.summary = None
 
-                # 4.2 使用智能分类器处理项目和话题
-                classification_result = self._classify_and_set_ids(tweet)
-
-                # 设置相应的ID字段（确保互斥性）
-                if classification_result.content_type == 'project':
-                    tweet.project_id = classification_result.project_id
-                    tweet.topic_id = None  # 确保topic_id为空
-                    tweet.entity_id = classification_result.project_id
-                    tweet.project_tag = classification_result.project_tag  # 设置RootData匹配的项目名称
-                    # 项目推文不需要提取token_tag
-                    tweet.token_tag = None
-                elif classification_result.content_type == 'topic':
-                    tweet.project_id = None  # 确保project_id为空
-                    tweet.topic_id = classification_result.topic_id
-                    tweet.entity_id = classification_result.topic_id
-                    tweet.project_tag = None  # 确保project_tag为空
-                    # 4.3 对于非项目推文，提取token symbols
-                    token_tag = self._extract_token_symbols(tweet.full_text)
-                    tweet.token_tag = token_tag
-                else:
-                    # 未知类型，清空所有分类字段
-                    tweet.project_id = None
-                    tweet.topic_id = None
-                    tweet.entity_id = None
-                    tweet.project_tag = None
-                    # 4.3 对于非项目推文，提取token symbols
-                    token_tag = self._extract_token_symbols(tweet.full_text)
-                    tweet.token_tag = token_tag
-
-                # 4.4 只对项目官方推文判断是否为重要公告
-                if tweet.is_real_project_tweet == 1:
-                    is_announce = self._classify_announcement(tweet.full_text)
-                    tweet.is_announce = is_announce
-
-                    # 4.6 对于公告推文，生成AI总结
-                    if is_announce == 1:
-                        announce_summary = self._generate_announcement_summary(tweet.full_text)
-                        tweet.summary = announce_summary
-                        self.logger.info(f"推文 {tweet.id_str} 公告总结: {announce_summary}")
-                else:
-                    # 非项目官方推文不判断公告
-                    tweet.is_announce = 0
-                    tweet.summary = None
-
-                self.logger.info(f"推文 {tweet.id_str} 增强完成: kol_id={kol_id}, valid={is_valid}, sentiment={sentiment}, project_id={tweet.project_id}, topic_id={tweet.topic_id}, entity_id={tweet.entity_id}, project_tag={tweet.project_tag}, token_tag={tweet.token_tag}, is_real_project_tweet={tweet.is_real_project_tweet}, is_announce={tweet.is_announce}, url={tweet_url}")
-            else:
-                # 无效推文不进行话题分析和情绪分析
-                tweet.sentiment = None
-                tweet.entity_id = None
-                tweet.project_id = None
-                tweet.topic_id = None
-                tweet.project_tag = None
-                tweet.token_tag = None  # 无效推文也不提取token
-                tweet.is_announce = 0  # 无效推文不是公告
-                
-                # 确认项目官方推文字段已设置（前面已经检查过了）
-                if not hasattr(tweet, 'is_real_project_tweet'):
-                    # 如果前面的检查失败了，重新检查
-                    try:
-                        is_project_kol = self._is_project_kol(tweet.kol_id)
-                        tweet.is_real_project_tweet = 1 if is_project_kol else 0
-                        self.logger.debug(f"补充检查无效推文 {tweet.id_str} 项目官方推文: kol_id={tweet.kol_id}, is_project_kol={is_project_kol}")
-                    except Exception as e:
-                        self.logger.error(f"补充检查无效推文 {tweet.id_str} 项目官方推文失败: {e}")
-                        tweet.is_real_project_tweet = 0
-                
-                self.logger.info(f"推文 {tweet.id_str} 标记为无效，kol_id={tweet.kol_id}, is_real_project_tweet={tweet.is_real_project_tweet}, url={tweet.tweet_url}")
+            self.logger.info(
+                f"推文 {tweet.id_str} 基础增强完成: "
+                f"kol_id={kol_id}, is_real_project_tweet={tweet.is_real_project_tweet}, "
+                f"url={tweet_url}"
+            )
             
             return tweet
             
@@ -629,13 +556,7 @@ class TweetEnricher:
             
             text_lower = text.lower()
             
-            # 方法1: 使用AI分析（如果API可用且启用）
-            if use_ai:
-                validation_result = self._ai_validate_content(text)
-                if validation_result is not None:
-                    return validation_result
-            
-            # 方法2: 基于关键词的内容验证（默认方法）
+            # AI 校验已禁用，只做本地关键词验证。
             return self._keyword_validate_content(text_lower)
             
         except Exception as e:
@@ -785,44 +706,9 @@ class TweetEnricher:
         return False
     
     def _ai_validate_content(self, text: str) -> Optional[bool]:
-        """
-        使用AI验证内容质量
-        
-        Args:
-            text: 推文内容
-            
-        Returns:
-            是否有效，None表示AI分析失败
-        """
-        try:
-            prompt = f"""
-            请分析以下推文是否符合以下标准：
-            1. 与加密货币、区块链、DeFi、NFT等相关
-            2. 不是明显的广告、推广或垃圾内容
-            3. 包含有价值的信息、观点或讨论
-            
-            推文内容: {text}
-            
-            请只返回 true 或 false：
-            - true: 符合标准的有效加密货币相关内容
-            - false: 不符合标准（非加密货币相关或明显广告）
-            """
-            
-            response = self.chatgpt._make_request([
-                {"role": "system", "content": "你是一个专业的内容质量检查员，专门识别有价值的加密货币内容。"},
-                {"role": "user", "content": prompt}
-            ], temperature=0.1, max_tokens=10)
-            
-            if response:
-                result = response.strip().lower()
-                return result == 'true'
-            
-            return None
-            
-        except Exception as e:
-            self.logger.warning(f"AI内容验证失败: {e}")
-            return None
-    
+        """AI 分析已从推文爬虫链路移除。"""
+        return None
+
     def _analyze_tweet_sentiment(self, text: str, use_ai: bool = True) -> Optional[str]:
         """
         分析推文情绪倾向
@@ -835,13 +721,7 @@ class TweetEnricher:
             情绪倾向：'Positive'/'Negative'/'Neutral'
         """
         try:
-            # 方法1: 使用AI分析（如果API可用且启用）
-            if use_ai:
-                ai_sentiment = self._ai_analyze_sentiment(text)
-                if ai_sentiment:
-                    return ai_sentiment
-            
-            # 方法2: 基于关键词的情绪分析（默认方法）
+            # AI 情绪分析已禁用，只做本地关键词分析。
             return self._keyword_analyze_sentiment(text.lower())
             
         except Exception as e:
@@ -907,35 +787,9 @@ class TweetEnricher:
             return 'Neutral'
     
     def _ai_analyze_sentiment(self, text: str) -> Optional[str]:
-        """
-        使用AI分析情绪
-        
-        Args:
-            text: 推文内容
-            
-        Returns:
-            情绪倾向或None
-        """
-        try:
-            sentiment_result = self.chatgpt.analyze_sentiment(text)
-            
-            if sentiment_result and 'sentiment' in sentiment_result:
-                ai_sentiment = sentiment_result['sentiment'].lower()
-                
-                # 映射到标准格式
-                if ai_sentiment == 'positive':
-                    return 'Positive'
-                elif ai_sentiment == 'negative':
-                    return 'Negative'
-                else:
-                    return 'Neutral'
-            
-            return None
-            
-        except Exception as e:
-            self.logger.warning(f"AI情绪分析失败: {e}")
-            return None
-    
+        """AI 分析已从推文爬虫链路移除。"""
+        return None
+
     def _extract_kol_id_from_user_data(self, tweet: Tweet, 
                                       user_data_map: Dict[str, Dict[str, Any]]) -> Optional[str]:
         """
@@ -1020,130 +874,20 @@ class TweetEnricher:
         return True
     
     def _classify_and_set_ids(self, tweet: Tweet):
-        """
-        使用智能分类器对推文进行分类，并设置project_id和topic_id
-
-        Args:
-            tweet: 推文对象
-
-        Returns:
-            ClassificationResult: 分类结果
-        """
-        try:
-            # 使用智能分类器进行分类
-            classification_result = smart_classifier.classify_tweet(tweet)
-
-            if classification_result.content_type == 'unknown':
-                self.logger.debug(f"推文 {tweet.id_str} 无法分类: {classification_result.reason}")
-            elif classification_result.content_type == 'project':
-                self.logger.info(f"推文 {tweet.id_str} 识别为项目: {classification_result.entity_name} " +
-                               f"(project_id: {classification_result.project_id}, " +
-                               f"新创建: {classification_result.is_new_created})")
-            elif classification_result.content_type == 'topic':
-                self.logger.info(f"推文 {tweet.id_str} 识别为话题: {classification_result.entity_name} " +
-                               f"(topic_id: {classification_result.topic_id}, " +
-                               f"新创建: {classification_result.is_new_created})")
-
-            return classification_result
-
-        except Exception as e:
-            self.logger.error(f"分类推文失败 {tweet.id_str}: {e}")
-            # 返回空的分类结果
-            from .smart_classifier import ClassificationResult
-            return ClassificationResult(content_type='unknown', reason=f"分类出错: {str(e)}")
+        """AI 分析已从推文爬虫链路移除。"""
+        raise RuntimeError("AI 分类已禁用：推文爬虫只做抓取、去重、入库、基础字段清洗")
 
     def _extract_token_symbols(self, text: str) -> Optional[str]:
-        """
-        从推文文本中提取token symbols
-
-        Args:
-            text: 推文文本
-
-        Returns:
-            提取的token symbol字符串（逗号分隔），如果没有则返回None
-        """
-        try:
-            if not text or len(text.strip()) < 10:
-                return None
-
-            # 1. 使用AI提取token symbols
-            ai_symbols = None
-            try:
-                ai_symbols = self.chatgpt.extract_token_symbols_from_tweet(text)
-                if ai_symbols:
-                    self.logger.debug(f"AI提取到的symbols: {ai_symbols}")
-            except Exception as e:
-                self.logger.warning(f"AI提取token失败，将使用规则提取: {e}")
-
-            # 2. 使用token_extractor验证和规范化
-            token_tag = self.token_extractor.extract_symbols_from_text(text, ai_symbols)
-
-            if token_tag:
-                self.logger.info(f"成功提取token symbols: {token_tag}")
-            else:
-                self.logger.debug("未能提取到有效的token symbols")
-
-            return token_tag
-
-        except Exception as e:
-            self.logger.error(f"提取token symbols失败: {e}")
-            return None
+        """AI 分析已从推文爬虫链路移除。"""
+        raise RuntimeError("AI Token 提取已禁用：推文爬虫只做抓取、去重、入库、基础字段清洗")
 
     def _classify_announcement(self, text: str) -> int:
-        """
-        判断推文是否为重要公告
-
-        Args:
-            text: 推文文本
-
-        Returns:
-            1表示是重要公告，0表示不是
-        """
-        try:
-            if not text or len(text.strip()) < 10:
-                return 0
-
-            # 使用ChatGPT判断是否为公告
-            is_announce = self.chatgpt.classify_tweet_announcement(text)
-
-            if is_announce == 1:
-                self.logger.info(f"识别为重要公告")
-            else:
-                self.logger.debug(f"非重要公告")
-
-            return is_announce
-
-        except Exception as e:
-            self.logger.error(f"判断公告失败: {e}")
-            return 0
+        """AI 分析已从推文爬虫链路移除。"""
+        return 0
 
     def _generate_announcement_summary(self, text: str) -> Optional[str]:
-        """
-        为公告推文生成AI总结
-
-        Args:
-            text: 推文文本
-
-        Returns:
-            公告总结文本，失败则返回None
-        """
-        try:
-            if not text or len(text.strip()) < 10:
-                return None
-
-            # 使用ChatGPT生成公告总结
-            summary = self.chatgpt.summarize_announcement(text)
-
-            if summary:
-                self.logger.info(f"成功生成公告总结: {summary}")
-                return summary
-            else:
-                self.logger.warning(f"公告总结生成失败，返回None")
-                return None
-
-        except Exception as e:
-            self.logger.error(f"生成公告总结失败: {e}")
-            return None
+        """AI 分析已从推文爬虫链路移除。"""
+        return None
 
 
 # 全局推文增强器实例

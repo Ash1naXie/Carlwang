@@ -1,11 +1,20 @@
 """
 Twitter数据爬虫核心模块
 """
+import json
 import logging
+import os
+from pathlib import Path
+import threading
 from typing import List, Dict, Any, Optional
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .api.twitter_api import twitter_api
+# 后端可切换：默认使用 Twitter API (twitterapi)，设置环境变量 TWITTER_API_BACKEND=tweetscout 使用 TweetScout
+# 为了向后兼容KOL推文爬取，现在默认使用 twitterapi
+if os.getenv("TWITTER_API_BACKEND", "twitterapi").lower() == "tweetscout":
+    from .api.twitter_api import twitter_api as selected_api_client
+else:
+    from .api.twitter_api_twitterapi import twitter_api as selected_api_client
 from .database.tweet_dao import tweet_dao
 from .database.user_dao import user_dao
 from .database.quotation_dao import quotation_dao
@@ -20,7 +29,66 @@ from .models.tweet import Tweet
 from .models.user import TwitterUser
 # from .topic_engine import topic_engine  # 话题分析已移除
 # from .kol_engine import kol_engine  # KOL分析已禁用
-from .project_engine import project_engine
+# Project/AI analysis is intentionally not imported by the crawler.
+
+try:
+    from .monitoring.reporter import safe_report, report_component_status, report_process_status
+except Exception:  # 监控模块不可用时不影响爬虫主流程
+    def safe_report(*args, **kwargs):
+        return False
+    def report_component_status(*args, **kwargs):
+        return False
+    def report_process_status(*args, **kwargs):
+        return False
+
+
+def _utc_text(value=None):
+    value = value or datetime.utcnow()
+    return value.strftime("%Y-%m-%d %H:%M:%S")
+
+def _duration_seconds(started_at):
+    return int((datetime.utcnow() - started_at).total_seconds())
+
+def _component_code(process_code, list_id):
+    if process_code == "db002_retail_core_lists":
+        return f"retail_core_list_{list_id}"
+    if process_code == "db002_alpha_address":
+        return f"alpha_address_{list_id}"
+    if process_code == "db002_global_media_watch":
+        return f"global_media_list_{list_id}"
+    return f"kol_list_{list_id}"
+
+def _component_name(process_code, list_id):
+    if process_code == "db002_retail_core_lists":
+        return f"Retail Core {list_id}"
+    if process_code == "db002_alpha_address":
+        return f"Alpha Address {list_id}"
+    if process_code == "db002_global_media_watch":
+        return f"Global Media Watch {list_id}"
+    return f"KOL List {list_id}"
+
+
+LAST_SEEN_PROCESS_CODES = {
+    "db002_retail_core_lists",
+    "db002_kol_tweet_general",
+    "db002_global_media_watch",
+}
+LAST_SEEN_STATE_FILE = Path(
+    os.getenv(
+        "TWITTER_LAST_SEEN_STATE_FILE",
+        str(Path(__file__).resolve().parent.parent / "daily_kol_tweet_crawler" / "last_seen_tweet_ids.json"),
+    )
+)
+
+
+def _tweet_id_value_from_api_data(tweet: Dict[str, Any]) -> Optional[str]:
+    for key in ("id_str", "id", "tweet_id"):
+        value = tweet.get(key)
+        if value is not None:
+            value = str(value).strip()
+            if value:
+                return value
+    return None
 
 
 class TwitterCrawler:
@@ -29,23 +97,18 @@ class TwitterCrawler:
     def __init__(self):
         """初始化爬虫"""
         self.logger = get_logger(__name__)
-        self.api_client = twitter_api
+        self.api_client = selected_api_client
         self.tweet_dao = tweet_dao
         self.user_dao = user_dao
         self.quotation_dao = quotation_dao
         self.data_mapper = data_mapper
         # self.topic_engine = topic_engine  # 话题分析已移除
         # self.kol_engine = kol_engine  # KOL分析已禁用
-        self.project_engine = project_engine
+        self.project_engine = None
         self.tweet_enricher = tweet_enricher
         self.quotation_extractor = quotation_extractor
-
-        # 初始化用户语言集成器（已禁用）
-        # from .api.chatgpt_client import chatgpt_client
-        # self.user_language_integration = UserLanguageIntegration(
-        #     db_manager=self.user_dao.db_manager,
-        #     chatgpt_client=chatgpt_client
-        # )
+        self._last_seen_lock = threading.Lock()
+        self._last_seen_candidates = {}
 
         # 爬取统计
         self.crawl_count = 0
@@ -54,16 +117,81 @@ class TwitterCrawler:
         self.last_crawl_time = None
         
         self.logger.info("Twitter爬虫初始化完成")
+
+    def _last_seen_enabled(self, process_code: Optional[str]) -> bool:
+        return bool(process_code and process_code in LAST_SEEN_PROCESS_CODES)
+
+    def _last_seen_key(self, process_code: str, list_id: str) -> str:
+        return f"{process_code}:{list_id}"
+
+    def _load_last_seen_state(self) -> Dict[str, Any]:
+        if not LAST_SEEN_STATE_FILE.exists():
+            return {}
+        with LAST_SEEN_STATE_FILE.open("r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            raise ValueError(f"last_seen 状态文件不是 JSON 对象: {LAST_SEEN_STATE_FILE}")
+        return state
+
+    def _write_last_seen_state(self, state: Dict[str, Any]) -> None:
+        LAST_SEEN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = LAST_SEEN_STATE_FILE.with_suffix(".tmp")
+        with temp_file.open("w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2, sort_keys=True)
+            f.write("\n")
+        temp_file.replace(LAST_SEEN_STATE_FILE)
+
+    def _get_last_seen_tweet_id(self, process_code: Optional[str], list_id: str) -> Optional[str]:
+        if not self._last_seen_enabled(process_code):
+            return None
+        state = self._load_last_seen_state()
+        value = state.get(self._last_seen_key(process_code, list_id))
+        if isinstance(value, dict):
+            value = value.get("tweet_id")
+        value = str(value).strip() if value else None
+        if value:
+            self.logger.info(f"last_seen checkpoint: process_code={process_code}, list_id={list_id}, tweet_id={value}")
+        return value
+
+    def _remember_last_seen_candidate(self, process_code: Optional[str], list_id: str, api_data: List[Dict[str, Any]]) -> None:
+        if not self._last_seen_enabled(process_code) or not api_data:
+            return
+        newest_tweet_id = _tweet_id_value_from_api_data(api_data[0])
+        if not newest_tweet_id:
+            return
+        with self._last_seen_lock:
+            self._last_seen_candidates[list_id] = newest_tweet_id
+
+    def _commit_last_seen_candidates(self, process_code: Optional[str]) -> None:
+        if not self._last_seen_enabled(process_code):
+            return
+        with self._last_seen_lock:
+            candidates = dict(self._last_seen_candidates)
+        if not candidates:
+            return
+
+        state = self._load_last_seen_state()
+        updated_at = _utc_text()
+        for list_id, tweet_id in candidates.items():
+            state[self._last_seen_key(process_code, list_id)] = {
+                "tweet_id": tweet_id,
+                "updated_at_utc": updated_at,
+                "process_code": process_code,
+                "list_id": list_id,
+            }
+        self._write_last_seen_state(state)
+        self.logger.info(f"last_seen checkpoint 已更新: process_code={process_code}, lists={len(candidates)}, file={LAST_SEEN_STATE_FILE}")
     
     def crawl_tweets(self, list_id: str = None, list_ids: List[str] = None, max_pages: int = None, 
-                    page_size: int = None, hours_limit: int = 2) -> bool:
+                    page_size: int = None, hours_limit: int = 2, process_code: str = None,
+                    execution_id: str = None) -> bool:
         """
         爬取推文数据
         
         Args:
             list_id: 单个列表ID，如果不指定则使用配置中的默认值（向后兼容）
             list_ids: 多个列表ID列表，优先级高于list_id
-            max_pages: 最大页数（从配置读取，默认100页）
+            max_pages: 最大页数（不超过15页）
             page_size: 每页大小
             hours_limit: 时间限制（小时），只拉取过去N小时的推文，默认2小时（生产环境使用UTC时间）
             
@@ -72,16 +200,43 @@ class TwitterCrawler:
         """
         self.crawl_count += 1
         self.last_crawl_time = datetime.now()
+        self.last_saved_tweet_count = 0
+        with self._last_seen_lock:
+            self._last_seen_candidates = {}
+        started_at = datetime.utcnow()
+        if process_code:
+            safe_report(
+                report_process_status,
+                process_code,
+                "running",
+                execution_id=execution_id,
+                start_time=_utc_text(started_at),
+            )
         
         try:
             self.logger.info(f"开始爬取推文数据 (第 {self.crawl_count} 次，时间限制: {hours_limit}小时)")
             
             # 1. 从API获取数据（支持多个list并行处理，最多15页，只拉取过去8小时）
-            api_data_list = self._fetch_api_data(list_id, list_ids, max_pages, page_size, hours_limit)
+            api_data_list = self._fetch_api_data(
+                list_id, list_ids, max_pages, page_size, hours_limit,
+                process_code=process_code,
+                execution_id=execution_id,
+            )
             
             if not api_data_list:
+                api_stats = self.api_client.get_request_stats()
+                if api_stats.get('total_requests', 0) > 0 and api_stats.get('error_count', 0) == 0:
+                    self.logger.info("API请求成功，时间窗口内没有新推文，任务视为成功")
+                    self._commit_last_seen_candidates(process_code)
+                    self.success_count += 1
+                    if process_code:
+                        safe_report(report_process_status, process_code, "success", execution_id=execution_id, start_time=_utc_text(started_at), end_time=_utc_text(), duration=_duration_seconds(started_at), total_records=0)
+                    return True
+
                 self.logger.warning("未获取到任何API数据")
                 self.error_count += 1
+                if process_code:
+                    safe_report(report_process_status, process_code, "failed", execution_id=execution_id, start_time=_utc_text(started_at), end_time=_utc_text(), duration=_duration_seconds(started_at), error_message="未获取到任何API数据")
                 return False
             
             self.logger.info(f"从API获取到 {len(api_data_list)} 条原始数据")
@@ -92,6 +247,8 @@ class TwitterCrawler:
             if not tweets:
                 self.logger.warning("数据映射后没有有效的推文数据")
                 self.error_count += 1
+                if process_code:
+                    safe_report(report_process_status, process_code, "failed", execution_id=execution_id, start_time=_utc_text(started_at), end_time=_utc_text(), duration=_duration_seconds(started_at), error_message="数据映射后没有有效的推文数据")
                 return False
             
             self.logger.info(f"成功映射 {len(tweets)} 条推文数据")
@@ -106,32 +263,45 @@ class TwitterCrawler:
             for api_data in api_data_list:
                 try:
                     tweet_id = api_data.get('id_str')
-                    user_data = api_data.get('user')
+                    # 兼容两种API：TweetScout使用'user'，Twitter API使用'author'
+                    user_data = api_data.get('user') or api_data.get('author')
                     if tweet_id and user_data and isinstance(user_data, dict):
                         user_data_map[tweet_id] = user_data
                 except Exception as e:
                     self.logger.warning(f"构建用户数据映射失败: {e}")
                     continue
             
+            is_predx_raw = self.tweet_dao.table_name == 'predx_raw_tweets'
+
             # 2.3 提取引用关系数据
-            self.logger.info("开始提取引用关系数据...")
-            quotations = self.quotation_extractor.extract_quotations_from_api_data(api_data_list)
-            valid_quotations = self.quotation_extractor.filter_valid_quotations(quotations)
-            self.logger.info(f"引用关系数据提取完成，获得 {len(valid_quotations)} 条有效引用关系")
+            if is_predx_raw:
+                valid_quotations = []
+                self.logger.info("PredX raw 模式跳过用户/引用关系落库，只写 predx_raw_tweets")
+            else:
+                self.logger.info("开始提取引用关系数据...")
+                quotations = self.quotation_extractor.extract_quotations_from_api_data(api_data_list)
+                valid_quotations = self.quotation_extractor.filter_valid_quotations(quotations)
+                self.logger.info(f"引用关系数据提取完成，获得 {len(valid_quotations)} 条有效引用关系")
             
             # 2.4 增强推文数据（添加 kol_id 和 entity_id）
-            self.logger.info("开始增强推文数据...")
-            enriched_tweets = self.tweet_enricher.enrich_tweets(tweets, user_data_map)
-            self.logger.info(f"推文增强完成，处理了 {len(enriched_tweets)} 条推文")
+            if is_predx_raw:
+                enriched_tweets = tweets
+                self.logger.info(f"PredX raw 模式跳过旧 KOL/项目增强，处理了 {len(enriched_tweets)} 条推文")
+            else:
+                self.logger.info("开始增强推文数据...")
+                enriched_tweets = self.tweet_enricher.enrich_tweets(tweets, user_data_map)
+                self.logger.info(f"推文增强完成，处理了 {len(enriched_tweets)} 条推文")
             
             # 3. 存储到数据库
             # 先保存用户数据（因为推文可能引用用户）
-            if users:
+            if users and not is_predx_raw:
                 user_saved_count = self._save_users_to_database(users)
                 self.logger.info(f"成功保存 {user_saved_count} 条用户数据")
             
             # 然后保存增强后的推文数据
             tweet_saved_count = self._save_tweets_to_database(enriched_tweets)
+            self.last_saved_tweet_count = tweet_saved_count
+            storable_tweet_count = self.tweet_dao.count_storable_tweets(enriched_tweets)
             
             # 保存引用关系数据
             quotation_saved_count = 0
@@ -140,6 +310,14 @@ class TwitterCrawler:
                 self.logger.info(f"成功保存 {quotation_saved_count} 条引用关系数据")
             
             # 4. 数据保存完成
+            if storable_tweet_count == 0:
+                self.logger.info("本轮没有需要入库的有效推文，任务视为成功")
+                self._commit_last_seen_candidates(process_code)
+                self.success_count += 1
+                if process_code:
+                    safe_report(report_process_status, process_code, "success", execution_id=execution_id, start_time=_utc_text(started_at), end_time=_utc_text(), duration=_duration_seconds(started_at), total_records=0)
+                return True
+
             if tweet_saved_count > 0:
                 self.logger.info(f"成功保存 {tweet_saved_count} 条推文到数据库")
                 
@@ -169,53 +347,46 @@ class TwitterCrawler:
                 # except Exception as e:
                 #     self.logger.error(f"KOL分析异常: {e}")
                 
-                # 进行项目分析
-                try:
-                    self.logger.info("开始进行项目分析...")
-                    project_success = self.project_engine.analyze_recent_tweets(hours=1, max_tweets=50)
+                # 爬虫阶段只负责抓取、去重、入库和基础字段清洗，不执行 AI 项目分析或活动结构化。
+                self.logger.info("跳过项目分析和活动结构化：推文爬虫保持纯抓取链路")
 
-                    if project_success:
-                        self.logger.info("项目分析完成")
-                    else:
-                        self.logger.warning("项目分析失败，但不影响主流程")
-
-                except Exception as e:
-                    self.logger.error(f"项目分析异常: {e}")
-
-                # 进行活动检测和结构化
-                try:
-                    self.logger.info("开始进行活动检测和结构化...")
-                    activity_success = self._detect_and_structure_activities(enriched_tweets)
-
-                    if activity_success:
-                        self.logger.info("活动检测和结构化完成")
-                    else:
-                        self.logger.warning("活动检测和结构化失败，但不影响主流程")
-
-                except Exception as e:
-                    self.logger.error(f"活动检测异常: {e}")
-
+                self._commit_last_seen_candidates(process_code)
                 self.success_count += 1
+                if process_code:
+                    safe_report(report_process_status, process_code, "success", execution_id=execution_id, start_time=_utc_text(started_at), end_time=_utc_text(), duration=_duration_seconds(started_at), total_records=tweet_saved_count)
                 return True
             else:
                 self.logger.error("保存推文到数据库失败")
                 self.error_count += 1
+                if process_code:
+                    safe_report(report_process_status, process_code, "failed", execution_id=execution_id, start_time=_utc_text(started_at), end_time=_utc_text(), duration=_duration_seconds(started_at), error_message="保存推文到数据库失败")
                 return False
                 
         except Exception as e:
             self.logger.error(f"爬取推文数据异常: {e}")
             self.error_count += 1
+            if process_code:
+                safe_report(report_process_status, process_code, "failed", execution_id=execution_id, start_time=_utc_text(started_at), end_time=_utc_text(), duration=_duration_seconds(started_at), error_message=str(e))
             return False
     
+
+    def _tag_api_data_source(self, api_data: List[Dict[str, Any]], list_id: str) -> List[Dict[str, Any]]:
+        """标记来源 List，供 predx_raw_tweets 保留原始来源。"""
+        for item in api_data or []:
+            if isinstance(item, dict):
+                item['_source_list_id'] = list_id
+        return api_data
+
     def _fetch_api_data(self, list_id: str = None, list_ids: List[str] = None, max_pages: int = None, 
-                       page_size: int = None, hours_limit: int = 2) -> List[Dict[str, Any]]:
+                       page_size: int = None, hours_limit: int = 2, process_code: str = None,
+                       execution_id: str = None) -> List[Dict[str, Any]]:
         """
         从API获取数据（支持并行获取多个list）
         
         Args:
             list_id: 单个列表ID（向后兼容）
             list_ids: 多个列表ID列表，优先级高于list_id
-            max_pages: 最大页数（从配置读取，默认100页）
+            max_pages: 最大页数（不超过15页）
             page_size: 每页大小
             hours_limit: 时间限制（小时），只拉取过去N小时的推文
             
@@ -241,13 +412,17 @@ class TwitterCrawler:
                 list_id_single = target_list_ids[0]
                 self.logger.info(f"单个list模式，list_id: {list_id_single}")
                 
-                api_data_list = self.api_client.fetch_all_tweets(
-                    list_id=list_id_single,
+                api_data_list = self._fetch_single_list_with_monitor(
+                    list_id_single,
                     max_pages=max_pages,
                     page_size=page_size,
-                    hours_limit=hours_limit
+                    hours_limit=hours_limit,
+                    process_code=process_code,
+                    execution_id=execution_id,
                 )
                 
+                api_data_list = self._tag_api_data_source(api_data_list, list_id_single)
+
                 # 获取API请求统计
                 stats = self.api_client.get_request_stats()
                 self.logger.info(f"API请求统计: {stats}")
@@ -264,11 +439,13 @@ class TwitterCrawler:
                 # 提交所有任务
                 future_to_list_id = {
                     executor.submit(
-                        self.api_client.fetch_all_tweets,
-                        list_id=single_list_id,
+                        self._fetch_single_list_with_monitor,
+                        single_list_id,
                         max_pages=max_pages,
                         page_size=page_size,
-                        hours_limit=hours_limit
+                        hours_limit=hours_limit,
+                        process_code=process_code,
+                        execution_id=execution_id,
                     ): single_list_id for single_list_id in target_list_ids
                 }
                 
@@ -279,7 +456,7 @@ class TwitterCrawler:
                         api_data = future.result()
                         if api_data:
                             self.logger.info(f"list_id {single_list_id} 获取到 {len(api_data)} 条数据")
-                            all_api_data.extend(api_data)
+                            all_api_data.extend(self._tag_api_data_source(api_data, single_list_id))
                         else:
                             self.logger.warning(f"list_id {single_list_id} 未获取到数据")
                     except Exception as e:
@@ -296,6 +473,70 @@ class TwitterCrawler:
             self.logger.error(f"从API获取数据失败: {e}")
             return []
     
+    def _fetch_single_list_with_monitor(self, list_id: str, max_pages: int = None, page_size: int = None,
+                                        hours_limit: int = 2, process_code: str = None,
+                                        execution_id: str = None) -> List[Dict[str, Any]]:
+        started_at = datetime.utcnow()
+        component_code = _component_code(process_code, list_id) if process_code else None
+        component_name = _component_name(process_code, list_id) if process_code else None
+        if process_code:
+            safe_report(
+                report_component_status,
+                process_code,
+                component_code,
+                component_name,
+                "running",
+                execution_id=execution_id,
+                start_time=_utc_text(started_at),
+                last_heartbeat_at=_utc_text(started_at),
+            )
+        try:
+            last_seen_tweet_id = self._get_last_seen_tweet_id(process_code, list_id)
+            api_data = self.api_client.fetch_all_tweets(
+                list_id=list_id,
+                max_pages=max_pages,
+                page_size=page_size,
+                hours_limit=hours_limit,
+                last_seen_tweet_id=last_seen_tweet_id,
+            )
+            self._remember_last_seen_candidate(process_code, list_id, api_data)
+            if process_code:
+                safe_report(
+                    report_component_status,
+                    process_code,
+                    component_code,
+                    component_name,
+                    "success",
+                    execution_id=execution_id,
+                    start_time=_utc_text(started_at),
+                    end_time=_utc_text(),
+                    duration=_duration_seconds(started_at),
+                    total_records=len(api_data or []),
+                    success_count=1,
+                    failed_count=0,
+                    last_heartbeat_at=_utc_text(),
+                )
+            return api_data
+        except Exception as exc:
+            if process_code:
+                safe_report(
+                    report_component_status,
+                    process_code,
+                    component_code,
+                    component_name,
+                    "failed",
+                    execution_id=execution_id,
+                    start_time=_utc_text(started_at),
+                    end_time=_utc_text(),
+                    duration=_duration_seconds(started_at),
+                    total_records=0,
+                    success_count=0,
+                    failed_count=1,
+                    error_message=str(exc),
+                    last_heartbeat_at=_utc_text(),
+                )
+            raise
+
     def _map_data_to_tweets(self, api_data_list: List[Dict[str, Any]]) -> List[Tweet]:
         """
         将API数据映射为Tweet对象
@@ -310,7 +551,36 @@ class TwitterCrawler:
             self.logger.info("开始映射API数据到Tweet对象...")
             
             tweets = self.data_mapper.map_api_data_list_to_tweets(api_data_list)
-            
+            source_by_id = {}
+            for item in api_data_list:
+                if not isinstance(item, dict):
+                    continue
+                item_id = item.get('id_str') or item.get('id') or item.get('tweet_id') or item.get('rest_id')
+                if item_id:
+                    source_by_id[str(item_id)] = item
+
+            for tweet in tweets:
+                item = source_by_id.get(str(tweet.id_str), {})
+                user_data = item.get('user') or item.get('author') or {}
+                if not isinstance(user_data, dict):
+                    user_data = {}
+                tweet.source_job_id = 'predx_raw_lists'
+                tweet.raw_json = {
+                    'source_list_id': item.get('_source_list_id'),
+                    'tweet_id': tweet.id_str,
+                    'author': user_data,
+                }
+                tweet.author_handle = (
+                    user_data.get('screen_name') or user_data.get('username') or
+                    user_data.get('userName') or tweet.user_name
+                )
+                tweet.author_name = user_data.get('name') or user_data.get('display_name') or tweet.user_name
+                tweet.followers_count = (
+                    user_data.get('followers_count') or user_data.get('followers') or
+                    user_data.get('followersCount') or 0
+                )
+                tweet.lang = item.get('lang') or item.get('language')
+
             # 数据去重（基于id_str）
             unique_tweets = self._deduplicate_tweets(tweets)
             
@@ -522,87 +792,8 @@ class TwitterCrawler:
             return 0
 
     def _detect_and_structure_activities(self, tweets: List[Tweet]) -> bool:
-        """
-        检测推文中的活动并结构化存储
-
-        Args:
-            tweets: 推文列表
-
-        Returns:
-            是否成功
-        """
-        try:
-            from .api.chatgpt_client import chatgpt_client
-            import json
-
-            # 活动关键词列表（用于初步过滤）
-            activity_keywords = [
-                'campaign', 'airdrop', 'quest', 'reward', 'giveaway',
-                'bounty', 'contest', 'prize', 'distribution', 'incentive',
-                '空投', '活动', '奖励', '赠送'
-            ]
-
-            # 过滤包含活动关键词的推文
-            candidate_tweets = []
-            for tweet in tweets:
-                if tweet.full_text:
-                    text_lower = tweet.full_text.lower()
-                    if any(keyword in text_lower for keyword in activity_keywords):
-                        candidate_tweets.append(tweet)
-
-            self.logger.info(f"从 {len(tweets)} 条推文中筛选出 {len(candidate_tweets)} 条候选活动推文")
-
-            if not candidate_tweets:
-                self.logger.info("没有发现包含活动关键词的推文")
-                return True
-
-            # 检测和结构化活动数据
-            activity_count = 0
-            for tweet in candidate_tweets:
-                try:
-                    # 1. 使用AI检测是否为真正的活动
-                    is_activity = chatgpt_client.detect_campaign_announcement([tweet.full_text])
-
-                    if is_activity:
-                        self.logger.info(f"检测到活动推文: {tweet.id_str}")
-
-                        # 2. 生成推文URL（使用通用格式，不需要用户名）
-                        tweet_url = f"https://twitter.com/i/status/{tweet.id_str}"
-
-                        # 3. 提取结构化数据
-                        activity_data = chatgpt_client.extract_activity_structured_data(
-                            tweet_text=tweet.full_text,
-                            tweet_url=tweet_url,
-                            tweet_time=str(tweet.created_at) if tweet.created_at else ""
-                        )
-
-                        if activity_data:
-                            # 4. 将结构化数据转换为JSON字符串存储到activity_detail字段
-                            activity_detail_json = json.dumps(activity_data, ensure_ascii=False)
-
-                            # 5. 更新数据库
-                            success = self._update_tweet_activity_status(
-                                tweet_id=tweet.id_str,
-                                is_activity=1,
-                                activity_detail=activity_detail_json
-                            )
-
-                            if success:
-                                activity_count += 1
-                                self.logger.info(f"活动数据已结构化: {activity_data['title']}")
-                        else:
-                            self.logger.warning(f"无法提取活动结构化数据: {tweet.id_str}")
-
-                except Exception as e:
-                    self.logger.error(f"处理推文活动检测失败 {tweet.id_str}: {e}")
-                    continue
-
-            self.logger.info(f"成功检测并结构化 {activity_count} 条活动推文")
-            return True
-
-        except Exception as e:
-            self.logger.error(f"活动检测和结构化失败: {e}")
-            return False
+        """活动结构化依赖 AI，推文爬虫链路已禁用。"""
+        raise RuntimeError("活动结构化已禁用：推文爬虫只做抓取、去重、入库、基础字段清洗")
 
     def _update_tweet_activity_status(self, tweet_id: str, is_activity: int,
                                      activity_detail: str) -> bool:
@@ -703,7 +894,7 @@ class TwitterCrawler:
             'database_quotation_count': self.quotation_dao.get_quotation_count(),
             # 'topic_stats': self.topic_engine.get_topic_statistics(),  # 话题分析已移除
             # 'kol_stats': self.kol_engine.get_kol_statistics(),  # KOL分析已禁用
-            'project_stats': self.project_engine.get_project_statistics()
+            # 项目分析已从推文爬虫链路移除。
         }
     
     def reset_statistics(self) -> None:
@@ -718,19 +909,22 @@ class TwitterCrawler:
     def crawl_project_tweets(self, max_pages: int = None, page_size: int = None, hours_limit: int = 2) -> bool:
         """
         爬取项目推文数据（简化流程版本）
-        
+
         Args:
-            max_pages: 最大页数（从配置读取，默认100页）
+            max_pages: 最大页数（不超过15页）
             page_size: 每页大小
             hours_limit: 时间限制（小时），只拉取过去N小时的推文，默认2小时
-            
+
         Returns:
             是否成功
         """
         self.crawl_count += 1
         self.last_crawl_time = datetime.now()
-        
+
         try:
+            # 重置API统计信息（避免累计）
+            self.api_client.reset_stats()
+
             self.logger.info(f"开始爬取项目推文数据 (第 {self.crawl_count} 次，时间限制: {hours_limit}小时)")
             
             # 1. 从API获取数据（使用配置中的list_ids_project）
@@ -770,7 +964,8 @@ class TwitterCrawler:
             for api_data in api_data_list:
                 try:
                     tweet_id = api_data.get('id_str')
-                    user_data = api_data.get('user')
+                    # 兼容 'user' 和 'author' 两种字段（新接口使用 author）
+                    user_data = api_data.get('user') or api_data.get('author')
                     if tweet_id and user_data and isinstance(user_data, dict):
                         user_data_map[tweet_id] = user_data
                 except Exception as e:
@@ -788,14 +983,70 @@ class TwitterCrawler:
                 user_saved_count = self._save_users_to_database(users)
                 self.logger.info(f"成功保存 {user_saved_count} 条用户数据")
             
-            # 保存项目推文数据到指定的项目表
-            project_table_name = 'twitter_tweet_back_test_cmc300'  # 指定新的项目推文表
-            tweet_saved_count = self.tweet_dao.batch_upsert_tweets(enriched_tweets, table_name=project_table_name)
-            
+            # 保存项目推文数据（使用普通推文的入库逻辑）
+            tweet_saved_count = self._save_tweets_to_database(enriched_tweets)
+
             # 4. 数据保存完成
             if tweet_saved_count > 0:
                 self.logger.info(f"成功保存 {tweet_saved_count} 条项目推文到数据库")
                 self.success_count += 1
+
+                # 打印 API 调用统计
+                api_stats = self.api_client.get_request_stats()
+                self.logger.info("=" * 50)
+                self.logger.info("📊 API 调用统计")
+                self.logger.info("=" * 50)
+                self.logger.info(f"总请求次数: {api_stats.get('total_requests', 0)}")
+                self.logger.info(f"获取推文数: {api_stats.get('tweets_fetched', 0)}")
+                self.logger.info(f"错误次数: {api_stats.get('error_count', 0)}")
+                self.logger.info(f"成功率: {api_stats.get('success_rate', 0):.2f}%")
+                if api_stats.get('total_requests', 0) > 0:
+                    self.logger.info(f"平均每次请求获取推文数: {api_stats.get('avg_tweets_per_request', 0):.1f}")
+                # 显示成本信息
+                self.logger.info("=" * 50)
+                self.logger.info("💰 API 成本统计")
+                self.logger.info("=" * 50)
+                self.logger.info(f"本次总成本: ${api_stats.get('total_cost_usd', 0):.6f} USD")
+                self.logger.info(f"平均每次请求成本: ${api_stats.get('avg_cost_per_request', 0):.6f} USD")
+                self.logger.info(f"每条推文平均成本: ${api_stats.get('total_cost_usd', 0) / max(api_stats.get('tweets_fetched', 1), 1):.6f} USD")
+                self.logger.info("=" * 50)
+
+                # 自动记录成本数据到数据库
+                try:
+                    import subprocess
+                    import os
+
+                    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    # 获取项目根目录（当前文件在 src/crawler.py）
+                    current_dir = os.path.dirname(os.path.abspath(__file__))
+                    project_root = os.path.dirname(current_dir)
+                    logger_path = os.path.join(project_root, 'src', 'utils', 'cost_db_logger.py')
+                    venv_python = os.path.join(project_root, 'venv', 'bin', 'python')
+
+                    if os.path.exists(logger_path) and os.path.exists(venv_python):
+                        cmd = [
+                            venv_python, logger_path,
+                            '--task-name', 'project_tweet',
+                            '--run-id', run_id,
+                            '--total-requests', str(api_stats.get('total_requests', 0)),
+                            '--total-cost', f"{api_stats.get('total_cost_usd', 0):.6f}",
+                            '--tweets-fetched', str(api_stats.get('tweets_fetched', 0)),
+                            '--error-count', str(api_stats.get('error_count', 0))
+                        ]
+
+                        self.logger.info(f"正在执行成本记录命令: {' '.join(cmd)}")
+                        result = subprocess.run(cmd, cwd=project_root, capture_output=True, text=True)
+
+                        if result.returncode == 0:
+                            self.logger.info("✓ 成本数据已自动记录到数据库")
+                        else:
+                            self.logger.error(f"❌ 记录成本数据脚本执行失败 (Exit Code: {result.returncode})")
+                            self.logger.error(f"标准错误输出: {result.stderr}")
+                            self.logger.error(f"标准输出: {result.stdout}")
+
+                except Exception as e:
+                    self.logger.error(f"🚨 记录成本数据过程发生异常: {e}")
+
                 return True
             else:
                 self.logger.error("保存项目推文到数据库失败")
@@ -804,6 +1055,150 @@ class TwitterCrawler:
                 
         except Exception as e:
             self.logger.error(f"爬取项目推文数据异常: {e}")
+            self.error_count += 1
+            return False
+
+    def update_historical_metrics(self, days: float = 7) -> bool:
+        """
+        更新历史推文的互动数据（点赞、转发、评论、浏览量）
+
+        Args:
+            days: 更新过去多少天的推文
+
+        Returns:
+            是否成功
+        """
+        self.crawl_count += 1
+        self.last_crawl_time = datetime.now()
+        started_at = datetime.utcnow()
+        if process_code:
+            safe_report(
+                report_process_status,
+                process_code,
+                "running",
+                execution_id=execution_id,
+                start_time=_utc_text(started_at),
+            )
+
+        try:
+            self.api_client.reset_stats()
+            self.logger.info(f"开始更新历史推文互动数据 (范围: 过去 {days} 天)")
+
+            # 1. 从数据库获取需要更新的推文ID
+            # 注意：这里直接操作 tweet_dao 的 db_manager，稍微破坏了封装但更高效
+            table_name = self.tweet_dao.table_name
+            # 计算起始时间
+            start_time = (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+
+            sql = f"SELECT id_str FROM {table_name} WHERE created_at_datetime >= %s ORDER BY created_at_datetime DESC"
+
+            self.logger.info(f"查询数据库中 {start_time} 之后的推文...")
+            results = self.tweet_dao.db_manager.execute_query(sql, (start_time,))
+
+            if not results:
+                self.logger.info("没有找到需要更新的推文")
+                return True
+
+            tweet_ids = [row['id_str'] for row in results]
+            self.logger.info(f"共找到 {len(tweet_ids)} 条需要更新的推文")
+
+            # 2. 调用 API 批量获取最新数据
+            # 注意：tweet_ids 可能会非常多，api_client.fetch_tweets_by_ids 内部已经做了分批处理
+            updated_tweets_data = self.api_client.fetch_tweets_by_ids(tweet_ids)
+
+            if not updated_tweets_data:
+                self.logger.warning("未从 API 获取到任何更新数据")
+                return False
+
+            self.logger.info(f"从 API 成功获取到 {len(updated_tweets_data)} 条推文的最新数据")
+
+            # 3. 构造 SQL 进行批量更新
+            # 我们只需要更新互动指标
+
+            batch_size = 500
+
+            sql_update = f"""
+                UPDATE {table_name}
+                SET favorite_count = %s,
+                    retweet_count = %s,
+                    reply_count = %s,
+                    quote_count = %s,
+                    view_count = %s,
+                    bookmark_count = %s
+                WHERE id_str = %s
+            """
+
+            update_params = []
+            for t_data in updated_tweets_data:
+                update_params.append((
+                    t_data.get('favorite_count', 0),
+                    t_data.get('retweet_count', 0),
+                    t_data.get('reply_count', 0),
+                    t_data.get('quote_count', 0),
+                    t_data.get('view_count', 0),
+                    t_data.get('bookmark_count', 0),
+                    t_data.get('id_str')
+                ))
+
+            if update_params:
+                self.logger.info(f"开始批量写入数据库 (共 {len(update_params)} 条)...")
+                total_affected = 0
+
+                # 分批执行 UPDATE
+                for i in range(0, len(update_params), batch_size):
+                    batch = update_params[i:i+batch_size]
+                    try:
+                        with self.tweet_dao.db_manager.get_cursor() as (conn, cursor):
+                            cursor.executemany(sql_update, batch)
+                            conn.commit()
+                            total_affected += len(batch)
+                    except Exception as e:
+                        self.logger.error(f"批量更新数据库失败 (批次 {i}): {e}")
+
+                self.logger.info(f"数据库更新完成，预计处理了 {total_affected} 条记录")
+                self.success_count += 1
+
+                # 记录成本（复用 run_project_once 里的逻辑）
+                api_stats = self.api_client.get_request_stats()
+                self.logger.info("=" * 50)
+                self.logger.info("💰 更新操作成本统计")
+                self.logger.info(f"API请求数: {api_stats.get('total_requests', 0)}")
+                self.logger.info(f"总成本: ${api_stats.get('total_cost_usd', 0):.6f} USD")
+                self.logger.info("=" * 50)
+
+                # 自动记录成本数据到数据库
+                try:
+                    import subprocess
+                    import os
+
+                    run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    current_dir = os.path.dirname(os.path.abspath(__file__))
+                    project_root = os.path.dirname(current_dir)
+                    logger_path = os.path.join(project_root, 'src', 'utils', 'cost_db_logger.py')
+                    venv_python = os.path.join(project_root, 'venv', 'bin', 'python')
+
+                    if os.path.exists(logger_path) and os.path.exists(venv_python):
+                        cmd = [
+                            venv_python, logger_path,
+                            '--task-name', 'update_metrics',
+                            '--run-id', run_id,
+                            '--total-requests', str(api_stats.get('total_requests', 0)),
+                            '--total-cost', f"{api_stats.get('total_cost_usd', 0):.6f}",
+                            '--tweets-fetched', str(api_stats.get('tweets_fetched', 0)),
+                            '--error-count', str(api_stats.get('error_count', 0))
+                        ]
+                        subprocess.run(cmd, cwd=project_root, capture_output=True, text=True)
+                        self.logger.info("✓ 成本数据已自动记录到数据库")
+                except Exception as e:
+                    self.logger.warning(f"记录成本数据失败: {e}")
+
+                return True
+            else:
+                self.logger.warning("没有需要更新的数据")
+                return False
+
+        except Exception as e:
+            self.logger.error(f"更新历史推文数据异常: {e}")
             self.error_count += 1
             return False
     
