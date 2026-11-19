@@ -2,7 +2,7 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_FILE="$SCRIPT_DIR/logs/topic_service.log"
 PYTHON_CMD="python3 main.py --mode topic"
-INTERVAL=300
+INTERVAL=900
 
 run_topic_analysis() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - Starting topic analysis..." >> "$LOG_FILE"
@@ -15,6 +15,6 @@ run_topic_analysis() {
 
 while true; do
     run_topic_analysis
-    echo "$(date '+%Y-%m-%d %H:%M:%S') - Waiting 5 minutes for next run..." >> "$LOG_FILE"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - Waiting 15 minutes for next run..." >> "$LOG_FILE"
     sleep $INTERVAL
 done

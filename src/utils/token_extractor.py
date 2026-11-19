@@ -18,12 +18,12 @@ class TokenExtractor:
         # 缓存coinmarketcap的symbol列表
         self._symbol_cache: Set[str] = set()
         self._symbol_map: Dict[str, str] = {}  # symbol -> 规范化的symbol
-        self._load_symbols_from_db()
+        # Symbols are validated on demand; Doris rejects a full-table cache scan.
 
     def _load_symbols_from_db(self):
         """从数据库加载所有的token symbol"""
         try:
-            sql = "SELECT DISTINCT symbol FROM public_data.coinmarketcap_cryptocurrency_listing"
+            sql = "SELECT symbol FROM public_data.coinmarketcap_cryptocurrency_listing WHERE symbol IS NOT NULL GROUP BY symbol"
             results = self.db_manager.execute_query(sql)
 
             if results:
@@ -44,7 +44,7 @@ class TokenExtractor:
         """重新加载symbol缓存"""
         self._symbol_cache.clear()
         self._symbol_map.clear()
-        self._load_symbols_from_db()
+        # Symbols are validated on demand; Doris rejects a full-table cache scan.
 
     def validate_symbols(self, symbols: List[str]) -> List[str]:
         """
@@ -60,10 +60,14 @@ class TokenExtractor:
 
         for symbol in symbols:
             symbol_upper = symbol.strip().upper()
-            if symbol_upper in self._symbol_cache:
-                validated_symbols.append(symbol_upper)
-            else:
-                self.logger.debug(f"Symbol {symbol} 不在coinmarketcap表中，已过滤")
+            if not symbol_upper:
+                continue
+            if symbol_upper not in self._symbol_cache:
+                sql = "SELECT symbol FROM public_data.coinmarketcap_cryptocurrency_listing WHERE symbol = %s"
+                if not self.db_manager.execute_query(sql, (symbol_upper,)):
+                    continue
+                self._symbol_cache.add(symbol_upper)
+            validated_symbols.append(symbol_upper)
 
         return validated_symbols
 

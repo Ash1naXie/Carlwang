@@ -4,7 +4,6 @@
 """
 import logging
 import re
-import json
 from typing import List, Dict, Any, Optional
 
 from ..models.tweet import Tweet
@@ -17,22 +16,7 @@ class SimpleTweetEnricher:
         """初始化简化版推文增强器"""
         self.logger = logging.getLogger(__name__)
         
-        # 延迟导入 chatgpt_client 来支持 AI 功能但避免在初始化时加载
-        self._chatgpt_client = None
-        
-        self.logger.info("简化版推文增强器初始化完成 - 无额外数据加载")
-    
-    def _get_chatgpt_client(self):
-        """延迟加载 ChatGPT 客户端"""
-        if self._chatgpt_client is None:
-            try:
-                from ..api.chatgpt_client import chatgpt_client
-                self._chatgpt_client = chatgpt_client
-                self.logger.debug("ChatGPT客户端延迟加载成功")
-            except Exception as e:
-                self.logger.error(f"ChatGPT客户端加载失败: {e}")
-                self._chatgpt_client = None
-        return self._chatgpt_client
+        self.logger.info("简化版推文增强器初始化完成 - 纯抓取字段清洗，无AI处理")
     
     def enrich_project_tweets_simple(self, tweets: List[Tweet], 
                                    user_data_map: Dict[str, Dict[str, Any]]) -> List[Tweet]:
@@ -96,36 +80,27 @@ class SimpleTweetEnricher:
         try:
             self.logger.debug(f"开始简化增强项目推文 {tweet.id_str}")
             
-            # 1. 设置 kol_id（直接从user_data获取）
+            # 1. 设置 kol_id 和 user_name（直接从user_data获取）
             if tweet.id_str in user_data_map:
                 user_data = user_data_map[tweet.id_str]
                 tweet.kol_id = user_data.get('id_str')
-                
+                tweet.user_name = user_data.get('screen_name')
+
                 # 2. 生成推文URL（使用实际用户名）
                 screen_name = user_data.get('screen_name', 'unknown')
                 tweet.tweet_url = f"https://x.com/{screen_name}/status/{tweet.id_str}"
             else:
                 tweet.kol_id = None
+                tweet.user_name = None
                 tweet.tweet_url = f"https://x.com/unknown/status/{tweet.id_str}"
             
-            # 3. 简化情绪分析
-            tweet.sentiment = self._simple_sentiment_analysis(tweet.full_text)
-            
-            # 4. 简化公告检测
-            tweet.is_announce = self._simple_announcement_detection(tweet.full_text)
-            # 如果是公告推文，生成AI总结
-            if tweet.is_announce == 1:
-                tweet.summary = self._generate_announcement_summary(tweet.full_text)
-            else:
-                tweet.summary = None
-            
-            # 5. 简化活动检测
-            tweet.is_activity = self._simple_activity_detection(tweet.full_text)
-            # 如果是活动推文，生成结构化活动详情
-            if tweet.is_activity == 1:
-                tweet.activity_detail = self._generate_activity_detail(tweet.full_text, tweet.id_str)
-            else:
-                tweet.activity_detail = None
+            # 3. 推文爬虫链路只保留基础字段清洗，不做情绪、公告、活动等分析。
+            tweet.sentiment = None
+            tweet.is_retweet = False
+            tweet.is_announce = 0
+            tweet.summary = None
+            tweet.is_activity = 0
+            tweet.activity_detail = None
             
             # 6. 简化链接提取
             tweet.link_url = self._simple_link_extraction(tweet.full_text)
@@ -153,20 +128,23 @@ class SimpleTweetEnricher:
             最小化增强的推文
         """
         try:
-            # 1. 设置kol_id（直接从用户数据获取）
+            # 1. 设置kol_id和user_name（直接从用户数据获取）
             if tweet.id_str in user_data_map:
                 user_data = user_data_map[tweet.id_str]
                 tweet.kol_id = user_data.get('id_str')
-                
+                tweet.user_name = user_data.get('screen_name')
+
                 # 2. 生成推文URL
                 screen_name = user_data.get('screen_name', 'unknown')
                 tweet.tweet_url = f"https://x.com/{screen_name}/status/{tweet.id_str}"
             else:
                 tweet.kol_id = None
+                tweet.user_name = None
                 tweet.tweet_url = f"https://x.com/unknown/status/{tweet.id_str}"
             
             # 3. 设置默认值
             tweet.sentiment = None
+            tweet.is_retweet = False
             tweet.is_announce = 0
             tweet.summary = None
             tweet.is_activity = 0
@@ -181,7 +159,35 @@ class SimpleTweetEnricher:
         except Exception as e:
             self.logger.error(f"最小化增强推文 {tweet.id_str} 失败: {e}")
             return tweet
-    
+
+    def _detect_retweet_status(self, api_data: Dict[str, Any]) -> bool:
+        """
+        从API数据中检测是否为转发推文
+
+        Args:
+            api_data: Twitter API返回的原始推文数据
+
+        Returns:
+            True表示是转发，False表示不是
+        """
+        try:
+            if not api_data:
+                return False
+
+            # 检查是否包含retweeted_status字段
+            # 当推文是转发时，Twitter API会返回retweeted_status对象
+            has_retweeted_status = 'retweeted_status' in api_data and api_data.get('retweeted_status')
+
+            if has_retweeted_status:
+                self.logger.debug(f"检测到转发推文: {api_data.get('id_str')}")
+                return True
+
+            return False
+
+        except Exception as e:
+            self.logger.error(f"检测转发状态失败: {e}")
+            return False
+
     def _simple_sentiment_analysis(self, text: str) -> Optional[str]:
         """
         简化的情绪分析 - 仅基于关键词
@@ -308,84 +314,14 @@ class SimpleTweetEnricher:
             self.logger.error(f"简化链接提取失败: {e}")
             return None
     
-    def _generate_announcement_summary(self, text: str) -> Optional[str]:
-        """
-        为公告推文生成AI总结
-        
-        Args:
-            text: 推文文本
-            
-        Returns:
-            公告总结文本，失败则返回None
-        """
-        try:
-            if not text or len(text.strip()) < 10:
-                return None
-            
-            # 获取ChatGPT客户端
-            chatgpt_client = self._get_chatgpt_client()
-            if not chatgpt_client:
-                self.logger.warning("ChatGPT客户端不可用，无法生成公告总结")
-                return None
-            
-            # 使用ChatGPT生成公告总结
-            summary = chatgpt_client.summarize_announcement(text)
-            
-            if summary:
-                self.logger.info(f"成功生成公告总结: {summary}")
-                return summary
-            else:
-                self.logger.warning("公告总结生成失败，返回None")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"生成公告总结失败: {e}")
-            return None
-    
-    def _generate_activity_detail(self, text: str, tweet_id: str) -> Optional[str]:
-        """
-        为活动推文生成结构化活动详情（JSON格式）
-        
-        Args:
-            text: 推文文本
-            tweet_id: 推文ID
-            
-        Returns:
-            活动详情JSON字符串，失败则返回None
-        """
-        try:
-            if not text or len(text.strip()) < 10:
-                return None
-            
-            # 获取ChatGPT客户端
-            chatgpt_client = self._get_chatgpt_client()
-            if not chatgpt_client:
-                self.logger.warning("ChatGPT客户端不可用，无法生成活动详情")
-                return None
-            
-            # 生成推文URL（使用通用格式）
-            tweet_url = f"https://twitter.com/i/status/{tweet_id}"
-            
-            # 使用ChatGPT提取结构化数据
-            activity_data = chatgpt_client.extract_activity_structured_data(
-                tweet_text=text,
-                tweet_url=tweet_url,
-                tweet_time=""  # 简化版本不传时间
-            )
-            
-            if activity_data:
-                # 将结构化数据转换为JSON字符串
-                activity_detail_json = json.dumps(activity_data, ensure_ascii=False)
-                self.logger.info(f"成功生成活动详情: {activity_data.get('title', '未知活动')}")
-                return activity_detail_json
-            else:
-                self.logger.warning(f"无法提取活动结构化数据: {tweet_id}")
-                return None
-                
-        except Exception as e:
-            self.logger.error(f"生成活动详情失败: {e}")
-            return None
+    def _generate_announcement_summary(self, *args, **kwargs):
+        """AI 分析已从推文爬虫链路移除。"""
+        raise RuntimeError("AI 分析已禁用：推文爬虫只做抓取、去重、入库、基础字段清洗")
+
+    def _generate_activity_detail(self, *args, **kwargs):
+        """AI 分析已从推文爬虫链路移除。"""
+        raise RuntimeError("AI 分析已禁用：推文爬虫只做抓取、去重、入库、基础字段清洗")
 
 
-# 全局实例
+# 全局简化推文增强器实例
 simple_tweet_enricher = SimpleTweetEnricher()

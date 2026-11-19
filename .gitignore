@@ -68,3 +68,24 @@ kol_fetch.pid
 
 # KOL Following Fetcher cache
 .kol_cache/
+
+# Production secrets, backups, and runtime data
+.env.*
+!.env.template
+!.env.example
+config/config.json.*
+!config/config.json.template
+.backup_*/
+*.bak*
+*.backup*
+*.orig
+*.log.*
+nohup.out
+crontab.bak*
+.claude/
+.kol_cache_new/
+progress*.json
+last_seen_tweet_ids.json
+failed_tweet_replay_*.jsonl
+*.state
+logs/*.json
